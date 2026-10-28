@@ -3,6 +3,8 @@ of *magic*, so beware.
 """
 import sys
 import types
+import weakref
+from threading import RLock
 from rpyc.lib import get_methods, get_id_pack
 from rpyc.lib.compat import pickle, maxint
 from rpyc.core import consts
@@ -10,6 +12,51 @@ from rpyc.core import consts
 
 builtin_id_pack_cache = {}  # name_pack -> id_pack
 builtin_classes_cache = {}  # id_pack -> class
+
+
+class NetrefScope(object):
+    """Identity token grouping connections that belong to one logical RPyC node.
+
+    Connections constructed with the *same* scope instance share their netref
+    registry: because the ``id_pack`` of a remote object is preserved across
+    relay (RPyC-over-RPyC) hops, the same source object arriving over several
+    independent connections is represented by a single, multi-routed netref
+    instead of one netref per connection.
+
+    Give one scope per logical node (e.g. a client process passes the same
+    scope to both of its relay connections). In a real deployment every node is
+    a separate process, so scopes are only needed when several nodes are
+    emulated inside one process; leaving the connection configuration unset
+    gives every connection a private scope (the historical behavior).
+
+    Instances compare and hash by identity and are weakly referenceable
+    because they are used as keys of a :class:`weakref.WeakKeyDictionary`.
+
+    Note: ``id()`` is only unique within a single address space, so a scope
+    may only group connections whose peers genuinely share one address space
+    (the RPyC relay use case these registries serve).
+    """
+    __slots__ = ("__weakref__",)
+
+    def __repr__(self):
+        return f"<netref-scope @{id(self):x}>"
+
+
+#: Registries of netrefs keyed by the source-object ``id_pack``, partitioned
+#: by :class:`NetrefScope`. Maps ``scope -> (id_pack -> netref)``; both levels
+#: are weak so neither scopes nor proxies are kept alive by the registry.
+_shared_proxy_cache = weakref.WeakKeyDictionary()
+_shared_proxy_lock = RLock()
+
+
+def _shared_scope_cache(scope, create=False):
+    cache = _shared_proxy_cache.get(scope)
+    if cache is None and create:
+        cache = weakref.WeakValueDictionary()
+        _shared_proxy_cache[scope] = cache
+    return cache
+
+
 # If these can be accessed, numpy will try to load the array from local memory,
 # resulting in exceptions and/or segfaults, see #236:
 DELETED_ATTRS = frozenset([
@@ -18,7 +65,9 @@ DELETED_ATTRS = frozenset([
 
 """the set of attributes that are local to the netref object"""
 LOCAL_ATTRS = frozenset([
-    '____conn__', '____id_pack__', '____refcount__', '__class__', '__cmp__', '__del__', '__delattr__',
+    '____conn__', '____id_pack__', '____refcount__', '____routes__', '____rlock__',
+    '____scope__',
+    '__class__', '__cmp__', '__del__', '__delattr__',
     '__dir__', '__doc__', '__getattr__', '__getattribute__', '__hash__', '__instancecheck__',
     '__init__', '__metaclass__', '__module__', '__new__', '__reduce__',
     '__reduce_ex__', '__repr__', '__setattr__', '__slots__', '__str__',
@@ -47,9 +96,145 @@ _builtin_types = [
 _normalized_builtin_types = {}
 
 
+# ------------------------------------------------------------------------------
+# multi-path routing
+# ------------------------------------------------------------------------------
+# A netref may be reachable through several independent connections (typically
+# RPyC-over-RPyC relay chains leading to the same source object). Each entry in
+# the proxy's ``____routes__`` map is ``connection -> local refcount``, where
+# the refcount equals the number of ``LABEL_REMOTE_REF`` occurrences received
+# over that connection -- each one corresponding to a remote-side incref.
+
+def _get_routes(proxy):
+    return object.__getattribute__(proxy, "____routes__")
+
+
+def _get_route_lock(proxy):
+    return object.__getattribute__(proxy, "____rlock__")
+
+
+def _route_alive(conn):
+    """Whether a request may still travel over ``conn``.
+
+    ``Connection.close`` sets its ``closed`` flag *before* invoking the
+    ``before_closed`` hook and sending ``HANDLE_CLOSE`` so a final request can
+    ride the still-open channel; route liveness therefore follows the
+    underlying channel/stream, which only closes during ``_cleanup``.
+    """
+    if conn is None:
+        return False
+    if not conn.closed:
+        return True
+    channel = getattr(conn, "_channel", None)
+    return channel is not None and not channel.closed
+
+
+def get_live_conn(proxy):
+    """Returns a connection over which the proxied object is reachable.
+
+    The most recently used connection is preferred while it is alive;
+    otherwise the first open route is chosen and cached in ``____conn__``.
+    Returns ``None`` when every route has been closed.
+    """
+    with _get_route_lock(proxy):
+        conn = object.__getattribute__(proxy, "____conn__")
+        if _route_alive(conn):
+            return conn
+        for candidate in _get_routes(proxy):
+            if _route_alive(candidate):
+                object.__setattr__(proxy, "____conn__", candidate)
+                return candidate
+        object.__setattr__(proxy, "____conn__", None)
+        return None
+
+
+def add_route(proxy, conn):
+    """Registers ``conn`` as an additional path to the proxied object and
+    accounts for one more remote-side reference held over that connection."""
+    with _get_route_lock(proxy):
+        routes = _get_routes(proxy)
+        routes[conn] = routes.get(conn, 0) + 1
+        object.__setattr__(proxy, "____refcount__",
+                           object.__getattribute__(proxy, "____refcount__") + 1)
+        if not _route_alive(object.__getattribute__(proxy, "____conn__")):
+            object.__setattr__(proxy, "____conn__", conn)
+
+
+def retire_connection(proxy, conn):
+    """Removes a (closed) connection from the set of usable paths.
+
+    When no route remains the proxy is also dropped from the shared registry,
+    so that a later re-delivery of the same ``id_pack`` creates a fresh proxy
+    instead of resurrecting a dead one. Returns ``True`` if routes remain.
+    """
+    with _get_route_lock(proxy):
+        routes = _get_routes(proxy)
+        routes.pop(conn, None)
+        current = object.__getattribute__(proxy, "____conn__")
+        if current is conn or not _route_alive(current):
+            replacement = next((c for c in routes if _route_alive(c)), None)
+            object.__setattr__(proxy, "____conn__", replacement)
+        id_pack = object.__getattribute__(proxy, "____id_pack__")
+        scope = object.__getattribute__(proxy, "____scope__")
+        empty = not routes
+    if empty and scope is not None:
+        with _shared_proxy_lock:
+            cache = _shared_scope_cache(scope)
+            if cache is not None and cache.get(id_pack) is proxy:
+                cache.pop(id_pack, None)
+    return not empty
+
+
+def discard_routes(proxy):
+    """Detaches every route without sending ``HANDLE_DEL``.
+
+    Used for netrefs that were constructed but lost the registration race to an
+    equivalent proxy: their single reference is accounted for on the winning
+    proxy instead, so no release message must be sent when they are collected.
+    """
+    with _get_route_lock(proxy):
+        _get_routes(proxy).clear()
+        object.__setattr__(proxy, "____conn__", None)
+
+
+def has_route(proxy, conn):
+    """Returns whether the peer of ``conn`` already holds the proxied object,
+    i.e. whether it can be shipped back as a ``LABEL_LOCAL_REF``."""
+    with _get_route_lock(proxy):
+        return conn in _get_routes(proxy)
+
+
+def shared_lookup(scope, id_pack):
+    """Returns the shared proxy for ``id_pack`` within ``scope`` if one with a
+    live route exists, ``None`` otherwise."""
+    with _shared_proxy_lock:
+        cache = _shared_scope_cache(scope)
+        proxy = cache.get(id_pack) if cache is not None else None
+        if proxy is not None and get_live_conn(proxy) is None:
+            proxy = None
+        return proxy
+
+
+def shared_register(scope, id_pack, proxy):
+    """Publishes ``proxy`` in the shared registry of ``scope`` unless another
+    live proxy is already registered for ``id_pack``; returns the proxy to use
+    (the existing winner or ``proxy`` itself)."""
+    with _shared_proxy_lock:
+        cache = _shared_scope_cache(scope, create=True)
+        existing = cache.get(id_pack)
+        if existing is not None and existing is not proxy and get_live_conn(existing) is not None:
+            return existing
+        cache[id_pack] = proxy
+        return proxy
+
+
 def syncreq(proxy, handler, *args):
     """Performs a synchronous request on the given proxy object.
     Not intended to be invoked directly.
+
+    When the proxy is reachable through several connections, any live route
+    may be used; if a route breaks while serving the request, the call is
+    retried over the next live route (a request may thus be re-executed).
 
     :param proxy: the proxy on which to issue the request
     :param handler: the request handler (one of the ``HANDLE_XXX`` members of
@@ -59,13 +244,30 @@ def syncreq(proxy, handler, *args):
     :raises: any exception raised by the operation will be raised
     :returns: the result of the operation
     """
-    conn = object.__getattribute__(proxy, "____conn__")
-    return conn.sync_request(handler, proxy, *args)
+    last_error = None
+    attempted = set()
+    while True:
+        conn = get_live_conn(proxy)
+        if conn is None or id(conn) in attempted:
+            if last_error is not None:
+                raise last_error
+            raise EOFError("the remote object is unreachable: all routing "
+                           "connections have been closed")
+        attempted.add(id(conn))
+        try:
+            return conn.sync_request(handler, proxy, *args)
+        except (EOFError, OSError) as ex:
+            # connection-level failure: retire the broken route and fail over
+            last_error = ex
+            retire_connection(proxy, conn)
 
 
 def asyncreq(proxy, handler, *args):
     """Performs an asynchronous request on the given proxy object.
     Not intended to be invoked directly.
+
+    The request is issued on any live route; unlike :func:`syncreq` there is
+    no automatic fail-over since the caller is not waiting on the result.
 
     :param proxy: the proxy on which to issue the request
     :param handler: the request handler (one of the ``HANDLE_XXX`` members of
@@ -75,7 +277,10 @@ def asyncreq(proxy, handler, *args):
     :returns: an :class:`~rpyc.core.async_.AsyncResult` representing
               the operation
     """
-    conn = object.__getattribute__(proxy, "____conn__")
+    conn = get_live_conn(proxy)
+    if conn is None:
+        raise EOFError("the remote object is unreachable: all routing "
+                       "connections have been closed")
     return conn.async_request(handler, proxy, *args)
 
 
@@ -110,20 +315,44 @@ class BaseNetref(object, metaclass=NetrefMetaclass):
                 remote-instance-id := id object instance (hits or misses on proxy cache)
         id_pack is usually created by rpyc.lib.get_id_pack
     """
-    __slots__ = ["____conn__", "____id_pack__", "__weakref__", "____refcount__"]
+    __slots__ = ["____conn__", "____id_pack__", "__weakref__", "____refcount__",
+                 "____routes__", "____rlock__", "____scope__"]
 
     def __init__(self, conn, id_pack):
-        self.____conn__ = conn
-        self.____id_pack__ = id_pack
-        self.____refcount__ = 1
+        object.__setattr__(self, "____id_pack__", id_pack)
+        object.__setattr__(self, "____rlock__", RLock())
+        object.__setattr__(self, "____routes__", {} if conn is None else {conn: 1})
+        object.__setattr__(self, "____conn__", conn)
+        object.__setattr__(self, "____refcount__", 1)
+        object.__setattr__(self, "____scope__",
+                           None if conn is None else getattr(conn, "_netref_scope", None))
 
     def __del__(self):
+        # Release the references held over every still-open route.
+        # Each connection owns an independent remote refcount; connections
+        # already closed have dropped theirs in ``Connection._cleanup``.
         try:
-            asyncreq(self, consts.HANDLE_DEL, self.____refcount__)
+            with _get_route_lock(self):
+                routes = dict(_get_routes(self))
+            if not routes:
+                return
+            for conn, count in routes.items():
+                if not _route_alive(conn):
+                    continue
+                try:
+                    # boxing still maps this netref to LABEL_LOCAL_REF while
+                    # the routes are intact, so the id pack is what is sent
+                    conn.async_request(consts.HANDLE_DEL, self, count)
+                except Exception:
+                    # raised in a destructor, most likely on program
+                    # termination, when the connection might have been
+                    # closed; the other side clears references on disconnect
+                    pass
+            with _get_route_lock(self):
+                _get_routes(self).clear()
+                object.__setattr__(self, "____conn__", None)
         except Exception:
-            # raised in a destructor, most likely on program termination,
-            # when the connection might have already been closed.
-            # it's safe to ignore all exceptions here
+            # it is safe to ignore all exceptions here
             pass
 
     def __getattribute__(self, name):
@@ -251,7 +480,8 @@ def _make_method(name, doc):
         def __array__(self, *args, **kwargs):
             # Note that protocol=-1 will only work between python
             # interpreters of the same version.
-            if not object.__getattribute__(self,'____conn__')._config["allow_pickle"]:
+            conn = get_live_conn(self)
+            if conn is None or not conn._config["allow_pickle"]:
                 # Security check that server side allows pickling per #551
                 raise ValueError("pickling is disabled")
             array = pickle.loads(syncreq(self, consts.HANDLE_PICKLE, -1))

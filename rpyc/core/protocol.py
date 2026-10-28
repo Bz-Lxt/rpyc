@@ -61,6 +61,14 @@ DEFAULT_CONFIG = dict(
     log_exceptions=True,
     # MISC
     allow_pickle=False,
+    # When the same hashable scope object is given to several connections,
+    # netrefs to the same source object (same id_pack) are shared between them
+    # as a single, multi-routed proxy. Use one scope per logical node: e.g. a
+    # client process gives both of its relay connections the same scope so
+    # that either connection can carry calls, callbacks and reference counts.
+    # None gives every connection its own scope, i.e. connections never share
+    # proxies (the historical per-connection behavior).
+    netref_scope=None,
     connid=None,
     credentials=None,
     endpoints=None,
@@ -94,6 +102,16 @@ Parameter                                Default value     Description
 ``allow_setattr``                        ``False``         Whether to allow setting of attributes (``setattr``)
 ``allow_delattr``                        ``False``         Whether to allow deletion of attributes (``delattr``)
 ``allow_pickle``                         ``False``         Whether to allow the use of ``pickle``
+``netref_scope``                         ``None``          Optional :class:`rpyc.NetrefScope` shared by
+                                                           connections of one logical node. Connections with
+                                                           the same scope represent the same source object
+                                                           (same id pack, e.g. over two RPyC relay chains)
+                                                           with a single multi-routed proxy: calls and
+                                                           callbacks may use any live route, a broken route
+                                                           is failed over, and the source object is released
+                                                           only once every route is gone. ``None`` gives
+                                                           every connection a private scope (proxies are
+                                                           never shared)
 
 ``include_local_traceback``              ``True``          Whether to include the local traceback
                                                            in the remote exception
@@ -159,6 +177,9 @@ class Connection(object):
 
         self._HANDLERS = self._request_handlers()
         self._channel = channel
+        # netref sharing scope (a private per-connection scope when unset)
+        netref_scope = self._config["netref_scope"]
+        self._netref_scope = netref.NetrefScope() if netref_scope is None else netref_scope
         self._seqcounter = itertools.count()
         self._recvlock = RLock()  # AsyncResult implementation means that synchronous requests have multiple acquires
         self._sendlock = Lock()
@@ -203,6 +224,13 @@ class Connection(object):
         self._local_root.on_disconnect(self)
         self._request_callbacks.clear()
         self._local_objects.clear()
+        # detach this connection from every multi-routed proxy it served;
+        # proxies with another live route keep working and are reclaimed on
+        # the other side only once every path has been released
+        for key in list(self._proxy_cache.keys()):
+            proxy = self._proxy_cache.get(key)
+            if proxy is not None:
+                netref.retire_connection(proxy, self)
         self._proxy_cache.clear()
         self._netref_classes_cache.clear()
         self._last_traceback = None
@@ -316,7 +344,7 @@ class Connection(object):
             return consts.LABEL_VALUE, obj
         if type(obj) is tuple:
             return consts.LABEL_TUPLE, tuple(self._box(item) for item in obj)
-        elif isinstance(obj, netref.BaseNetref) and obj.____conn__ is self:
+        elif isinstance(obj, netref.BaseNetref) and netref.has_route(obj, self):
             return consts.LABEL_LOCAL_REF, obj.____id_pack__
         else:
             id_pack = get_id_pack(obj)
@@ -336,14 +364,43 @@ class Connection(object):
             return self._local_objects[value]
         if label == consts.LABEL_REMOTE_REF:
             id_pack = (str(value[0]), value[1], value[2])  # so value is a id_pack
-            proxy = self._proxy_cache.get(id_pack)  # Ensure referents exist until we increment refcount issue #558
-            if proxy is not None:
-                proxy.____refcount__ += 1  # if cached then remote incremented refcount, so sync refcount
-            else:
-                proxy = self._netref_factory(id_pack)
-                self._proxy_cache[id_pack] = proxy
-            return proxy
+            return self._get_or_create_proxy(id_pack)
         raise ValueError(f"invalid label {label!r}")
+
+    def _get_or_create_proxy(self, id_pack):  # boxing
+        """Returns the (possibly shared) proxy for ``id_pack`` on this connection.
+
+        The proxy registry is process-wide: the same source object delivered
+        over several independent connections (e.g. two RPyC relay chains) maps
+        to a single netref with one route per connection. Every received
+        ``LABEL_REMOTE_REF`` accounts for one remote-side reference, so the
+        per-route refcount is incremented here and released with
+        ``HANDLE_DEL`` (or dropped when the connection is closed).
+        """
+        # Ensure referents exist until we increment refcount, see issue #558
+        proxy = self._proxy_cache.get(id_pack)
+        if proxy is not None:
+            netref.add_route(proxy, self)
+            return proxy
+        # same source object seen first through another connection/relay chain
+        proxy = netref.shared_lookup(self._netref_scope, id_pack)
+        if proxy is not None:
+            netref.add_route(proxy, self)
+            self._proxy_cache[id_pack] = proxy
+            return proxy
+        # building a proxy class may issue a HANDLE_INSPECT sync request, so
+        # it happens without holding the shared registry lock
+        proxy = self._netref_factory(id_pack)  # proxy starts routed on self
+        winner = netref.shared_register(self._netref_scope, id_pack, proxy)
+        if winner is not proxy:
+            # a concurrent delivery over another connection won the race; the
+            # reference we received belongs to the winning shared proxy
+            netref.discard_routes(proxy)
+            netref.add_route(winner, self)
+            self._proxy_cache[id_pack] = winner
+            return winner
+        self._proxy_cache[id_pack] = proxy
+        return proxy
 
     def _netref_factory(self, id_pack):  # boxing
         """id_pack is for remote, so when class id fails to directly match """
@@ -866,14 +923,17 @@ class Connection(object):
         return tuple(dir(obj))
 
     def _handle_inspect(self, id_pack):  # request handler
-        if hasattr(self._local_objects[id_pack], '____conn__'):
+        local_obj = self._local_objects[id_pack]
+        if isinstance(local_obj, netref.BaseNetref):
             # When RPyC is chained (RPyC over RPyC), id_pack is cached in local objects as a netref
-            # since __mro__ is not a safe attribute the request is forwarded using the proxy connection
-            # see issue #346 or tests.test_rpyc_over_rpyc.Test_rpyc_over_rpyc
-            conn = self._local_objects[id_pack].____conn__
+            # since __mro__ is not a safe attribute the request is forwarded using a live proxy
+            # connection (any upstream route will do), see issue #346 and the multipath tests
+            conn = netref.get_live_conn(local_obj)
+            if conn is None:
+                raise EOFError("upstream connection closed")
             return conn.sync_request(consts.HANDLE_INSPECT, id_pack)
         else:
-            return tuple(get_methods(netref.LOCAL_ATTRS, self._local_objects[id_pack]))
+            return tuple(get_methods(netref.LOCAL_ATTRS, local_obj))
 
     def _handle_getattr(self, obj, name):  # request handler
         return self._access_attr(obj, name, (), "_rpyc_getattr", "allow_getattr", getattr)
@@ -903,11 +963,14 @@ class Connection(object):
         #  + refactor cache instancecheck/inspect/class_factory
         #  + improve cache docs
 
-        if hasattr(obj, '____conn__'):  # keep unwrapping!
+        if isinstance(obj, netref.BaseNetref):  # keep unwrapping!
             # When RPyC is chained (RPyC over RPyC), id_pack is cached in local objects as a netref
-            # since __mro__ is not a safe attribute the request is forwarded using the proxy connection
+            # since __mro__ is not a safe attribute the request is forwarded using a live proxy
+            # connection (any upstream route will do)
             # relates to issue #346 or tests.test_netref_hierachy.Test_Netref_Hierarchy.test_StandardError
-            conn = obj.____conn__
+            conn = netref.get_live_conn(obj)
+            if conn is None:
+                raise EOFError("upstream connection closed")
             return conn.sync_request(consts.HANDLE_INSPECT, other_id_pack)
         # Create a name pack which would be familiar here and see if there is a hit
         other_id_pack2 = (other_id_pack[0], other_id_pack[1], 0)

@@ -1,3 +1,15 @@
+Unreleased
+==========
+
+- Multi-path netrefs: connections may share a ``netref_scope`` (a
+  :class:`rpyc.NetrefScope` instance) so that the same source object reached
+  over several independent connections (e.g. two RPyC-over-RPyC relay chains)
+  is represented by one proxy. Calls and bidirectional callbacks can be served
+  over any live route, a broken route is failed over transparently, closing
+  one connection leaves the others intact, and the source object is reclaimed
+  only after every route is released. ``netref_scope`` unset (the default)
+  preserves the historical per-connection behavior.
+
 6.0.1
 =====
 Date: 2024-09-24

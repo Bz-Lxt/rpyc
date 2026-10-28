@@ -27,7 +27,7 @@ Classic-style usage::
 """
 # flake8: noqa: F401
 from rpyc.core import (SocketStream, TunneledSocketStream, PipeStream, Channel,
-                       Connection, Service, BaseNetref, AsyncResult, GenericException,
+                       Connection, Service, BaseNetref, NetrefScope, AsyncResult, GenericException,
                        AsyncResultTimeout, VoidService, SlaveService, MasterService, ClassicService)
 from rpyc.utils.factory import (connect_stream, connect_channel, connect_pipes,
                                 connect_stdpipes, connect, ssl_connect, list_services, discover, connect_by_service, connect_subproc,
